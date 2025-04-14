@@ -1,0 +1,793 @@
+; ================================
+; タイピングゲーム
+; ================================
+
+#include "kernel32.as"
+#include "user32.as"
+#uselib "winmm.dll"
+#cfunc timeGetTime "timeGetTime"
+
+#define WM_COMMAND 0x0111
+#define CBN_SELCHANGE 1
+#define ctype LOWORD(%1) ((%1) & 0xFFFF)
+#define ctype HIWORD(%1) (((%1) >> 16) & 0xFFFF)
+#define DT_WORDBREAK 0x10
+
+; -------------------------------
+; ディレクトリパス関連定義
+; -------------------------------
+#define FOLDER_PASS    dir_cur + "\\save"    ; テキストやオプション等を保存するフォルダ
+#define SOURCE_PATH    dir_cur + "\\source"        ; 画像・音声素材をまとめるフォルダ
+
+; -------------------------------
+; ファイル名定義
+; -------------------------------
+#define TOP_IMAGE   SOURCE_PATH + "\\TopKeyboard.jpg"
+#define TYPE_SOUND  SOURCE_PATH + "\\PC-KeyboardSound.wav"
+#define COUNTDOWN   SOURCE_PATH + "\\CountDown.wav"
+
+; -------------------------------
+; フォント指定
+; -------------------------------
+font "msgothic", 20
+
+; -------------------------------
+; 関数モジュール
+; -------------------------------
+#module
+
+; 単純なカウントアップ関数
+#defcfunc count int num
+    return double(num) + 1
+
+; 入力と正解を比較し、間違えた文字を抽出
+; hantei_flag=1 → 間違えがあるかどうかを (0 or 1) で返す
+#defcfunc char_hantei str text1, str text2, int hantei_flag
+    sdim buf1, strlen(text1)*2 + 2
+    sdim buf2, strlen(text2)*2 + 2
+    cnvstow buf1, text1
+    cnvstow buf2, text2
+    hantei_miss = 0
+    miss_str = ""
+
+    repeat
+        tmp1 = wpeek(buf1, cnt*2)
+        if tmp1 = 0 : break
+        tmp2 = wpeek(buf2, cnt*2)
+        if tmp2 = 0 : break
+
+        if tmp1 == tmp2 {
+            ; 同一文字ならスペース化
+            if (tmp1 >= 32 and tmp1 <= 126) or (tmp1 >= 65382 and tmp1 <= 65439) {
+                miss_str += " "
+            } else {
+                miss_str += "　"
+            }
+        } else {
+            miss_str += cnvwtos(tmp1)
+            hantei_miss = 1
+        }
+    loop
+
+    if hantei_flag = 1 {
+        return hantei_miss
+    }
+    return miss_str
+
+; ウィンドウをクリアする
+; i=1 → 画面＆オブジェクト全消去、他 → 画面のみクリア
+#deffunc window_clr int mode
+    if mode == 1 {
+        color 255,255,255 : boxf
+        clrobj 0,-1
+        color 0,0,0
+        pos 0,0
+    } else {
+        color 255,255,255 : boxf
+        color 0,0,0
+        pos 0,0
+    }
+return
+
+; フォルダが存在するか確認（無ければ作成）
+#defcfunc make_folder str pass
+    dirlist dummy,pass,5
+    if stat == 0 {
+        folder_exist = 0
+        dialog "カレントディレクトリにフォルダを作成しますか？",2,"フォルダがありません!"
+        if stat == 6 {
+            mkdir "save"
+            dialog "saveフォルダーを作成しました",0
+            folder_exist = 1
+        } else : if stat == 7 {
+            dialog "作成が却下されました",0
+        }
+    } else {
+        folder_exist = 1
+    }
+    return folder_exist
+#global
+
+; -------------------------------
+; 変数宣言
+; -------------------------------
+Moji_count = 0
+Seikai_flag = 0
+Imput_length_total = 0
+Seikai_count = 0
+Start_flag = 0
+Key_count = 0
+Text_Num = 0
+question_num = 10
+end_flag = 0
+Imput_Text_id = 0
+question_num_id = 0
+option_button_id = 0
+sdim Text, 128, 64
+Mondai_count = 0
+
+; オプション用
+Asset_Type = 0
+option1_id = 0
+Miss_Use = 1
+option2_id = 0
+Detail_info = 0
+option3_id = 0
+Miss_Beep = 1
+option4_id = 0
+Miss_Count = 1
+option5_id = 0
+Type_SE = 0
+option6_id = 0
+
+; テキスト読み込み用
+sdim Text_ext, 128, 64
+Exp_Text_Num = 0
+text_buf = ""
+sdim Other_Text, 128, 64
+Other_Text_Num = 0
+Other_Text_Pass = "NULL"
+
+; 結果表示用
+dim Result_List, 256, 6
+Result_List_char = ""
+
+; -------------------------------
+; メイン画面生成
+; -------------------------------
+screen 0, ginfo(20), ginfo(21)
+width 640, 480
+GetWindowLong hwnd, -16
+SetWindowLong hwnd, -16, stat | $10000 | $40000
+title "TypingGame ver1.1"
+randomize
+
+; -------------------------------
+; 内部アセット問題
+; -------------------------------
+sdim Text_int, 128, 64
+Text_int.0 ="新しいスーツを買って、入社式に備える。"
+Text_int.1 ="隣の客はよく柿食う客だ。"
+Text_int.2 ="隣の竹垣に竹立て掛けた。"
+Text_int.3 ="今日歯医者に行く。"
+Text_int.4 ="「本日は晴天なり」と口を揃えて、発音する。"
+Text_int.5 ="蜘蛛の形によく似た雲を見つけた。"
+Text_int.6 ="かえる　蛙　カエル　帰る　変える　買える　代える"
+Text_int.7 ="テレビで自転車事故のニュースを聞いた。"
+Text_int.8 ="郵便局は、駅の北口からまっすぐに進み、2つ目の交差点を左に曲がったところにある茶色のビルです。"
+Text_int.9 ="休日の朝は、ゆっくり起きてブランチを取るようにしている。のんびりした1日を過ごすことが、1週間の疲れを癒し、次の活力になってくれる。"
+Text_int.10 ="こんにちは"
+Text_int.11 ="近畿大学工学部"
+Text_int.12 ="このたび、新社屋が完成し、10月1日より業務を開始させていただく運びとなりました。"
+Text_int.13 ="西洋古代古典期の著作家としては例外的に、プラトンが人に読ませることを意図して書いたものは、すべて現代にまで現存していると考えられている。"
+
+; -------------------------------
+; オプション読み込み
+; -------------------------------
+notesel option_note
+exist FOLDER_PASS + "\\option.txt"
+if strsize != -1 {
+    noteload FOLDER_PASS + "\\option.txt"
+    option_num = 0
+    repeat
+        noteget text_buf, cnt
+        if text_buf = "" : break
+        if instr(text_buf, , "//") != 0 {
+            option_num++
+        }
+        if option_num == 1 : Asset_Type   = int(text_buf)
+        if option_num == 2 : Miss_Use     = int(text_buf)
+        if option_num == 3 : Detail_info  = int(text_buf)
+        if option_num == 4 : Miss_Beep    = int(text_buf)
+        if option_num == 5 : Other_Text_Pass = text_buf
+        if option_num == 6 : Miss_Count   = int(text_buf)
+        if option_num == 7 : Type_SE      = int(text_buf)
+    loop
+
+    if Asset_Type == 1 {
+        notesel data
+        noteload FOLDER_PASS + "\\Assets.txt"
+        Exp_Text_Num = 0
+        repeat
+            noteget text_buf, cnt
+            if text_buf = "" : break
+            if instr(text_buf, , "//") != 0 {
+                Text_ext(Exp_Text_Num) = text_buf
+                Exp_Text_Num++
+            }
+        loop
+    }
+    if Asset_Type == 2 {
+        notesel data
+        noteload Other_Text_Pass
+        Other_Text_Num = 0
+        repeat
+            noteget text_buf, cnt
+            if text_buf = "" : break
+            if instr(text_buf, , "//") != 0 {
+                Other_Text(Other_Text_Num) = text_buf
+                Other_Text_Num++
+            }
+        loop
+    }
+}
+
+*start
+    window_clr 1
+    if end_flag == 0 {
+        oncmd gosub *resize, 5
+        oncmd gosub *command, WM_COMMAND
+        onexit *ending
+        onkey gosub *key
+    } else {
+        randomize
+        Elapsed_time = 0
+        Moji_count = 0
+        Seikai_flag = 0
+        Imput_length_total = 0
+        Seikai_count = 0
+        Start_flag = 0
+        Key_count = 0
+        question_num = 10
+        end_flag = 0
+        Text_Num = 0
+        Mondai_count = 0
+        dim Result_List, 256, 6
+        Result_List_char = ""
+    }
+
+    pos 70,100
+    picload TOP_IMAGE, 1
+    pos 70,50
+    mes "タイピングゲーム"
+    mes "エンターキーで開始"
+    pos 370,70
+    mes "問題数"
+    pos 430,70
+    input question_num,60,20,3
+    question_num_id = stat
+    hInput = objinfo(stat, 2)
+    pos 505,70
+    button gosub "設定", *option
+    option_button_id = stat
+    pos 100,400
+    Imput_Text = ""
+    input Imput_Text, 400,40,200
+    Imput_Text_id = stat
+    hInput = objinfo(stat, 2)
+
+    repeat
+        if Start_flag == 1 {
+            Now_time = timeGetTime()
+            Elapsed_time = (Now_time - Start_time)
+            color 255,255,255
+            boxf 520,370,640,420
+            color 0,0,0
+            pos 520,370
+            mes "経過時間 " + str(int(Elapsed_time)/1000)
+            wait 12
+        } else {
+            wait 12
+        }
+    loop
+    stop
+
+; -------------------------------
+; WM_COMMAND
+; -------------------------------
+*command
+    if lparam == hInput {
+        if HIWORD(wparam) == $300 {
+            gosub *main
+            return
+        }
+        return
+    }
+    if lparam == hResult_List {
+        if HIWORD(wparam) == 1 {
+            color 255,255,255
+            boxf 0,410,640,440
+            color 0,0,0
+            pos 0,413
+            mes "文字数:" + str(Result_List(Result_List_Select,5)) + " タイプ数:" + str(Result_List(Result_List_Select,4) - Result_List(Result_List_Select,3)) + " 所要時間(s):" + strf("%4.2f", double((Result_List(Result_List_Select,2)) - double(Result_List(Result_List_Select,1)))/1000)　+ " タイプ速度/入力速度(m):"  + strf("%4.2f", ((double((Result_List(Result_List_Select,4) - Result_List(Result_List_Select,3))) / double((Result_List(Result_List_Select,2)) - double(Result_List(Result_List_Select,1)))/1000)*60)*1000000 ) + "/" + strf("%4.2f", ((double(Result_List(Result_List_Select,5)) / double((Result_List(Result_List_Select,2)) - double(Result_List(Result_List_Select,1)))/1000)*60)*1000000 )
+            return
+        }
+        return
+    }
+return
+
+; -------------------------------
+; ウィンドウサイズ変更
+; -------------------------------
+*resize
+return
+
+; -------------------------------
+; メイン処理
+; -------------------------------
+*main
+    if Start_flag == 1 {
+        window_clr 0
+        gosub *mondai
+        gosub *hantei
+        gosub *drow
+        Moji_count = count(Moji_count)
+    }
+return
+
+; -------------------------------
+; 問題を切り替える
+; -------------------------------
+*mondai
+    if (Moji_count == 0) or (Seikai_flag == 1) {
+        Text_Number = rnd(int(Text_Num))
+        Now_Text = Text.(Text_Number)
+        if Seikai_flag == 1 {
+            Seikai_count = count(Seikai_count)
+            Result_List(Mondai_count,2) = timeGetTime()
+            Result_List(Mondai_count,4) = int(Key_count)
+            Mondai_count++
+            Result_List(Mondai_count,0) = int(Text_Number)
+            Result_List(Mondai_count,1) = timeGetTime()
+            Result_List(Mondai_count,3) = int(Key_count)
+            Seikai_flag = 0
+            Imput_Text = ""
+            objprm Imput_Text_id, Imput_Text
+            objsel Imput_Text_id
+            if Seikai_count == question_num {
+                gosub *finish
+            }
+        } else {
+            Result_List(Mondai_count,0) = int(Text_Number)
+            Result_List(Mondai_count,1) = timeGetTime()
+            Result_List(Mondai_count,3) = int(Key_count)
+        }
+    }
+return
+
+; -------------------------------
+; 入力判定
+; -------------------------------
+*hantei
+    MultiByteToWideChar 0, 0, varptr(Now_Text), -1, 0, 0
+    Now_lengh = stat - 1
+    MultiByteToWideChar 0, 0, varptr(Imput_Text), -1, 0, 0
+    Imput_length = stat - 1
+    Result_List(Mondai_count,5) = int(Now_lengh)
+
+    if Now_Text == Imput_Text {
+        Seikai_flag = 1
+        Imput_length_total += Imput_length
+        gosub *mondai
+    }
+
+    Miss_Text = char_hantei(Now_Text, Imput_Text, 0)
+    if Miss_Beep == 0 {
+        if key_code != 8 {
+            if char_hantei(Now_Text, Imput_Text, 1) == 1 {
+                MessageBeep $30
+            }
+        }
+    }
+return
+
+; -------------------------------
+; 描画処理
+; -------------------------------
+*drow
+    pos 0,0
+    RECT = 0,0,ginfo_winx,ginfo_winy
+    DrawText hdc, varptr(Text.Text_Number), -1, varptr(RECT), DT_WORDBREAK
+    if Miss_Use == 1 {
+        color 255,0,0
+        DrawText hdc, varptr(Miss_Text), -1, varptr(RECT), DT_WORDBREAK
+        color 0,0,0
+    }
+    RECT = 0,60,ginfo_winx,ginfo_winy
+    DrawText hdc, varptr(Imput_Text), -1, varptr(RECT), DT_WORDBREAK
+    redraw
+
+    if Detail_info == 1 {
+        pos 0,120
+        mes "--------------------------------"
+        mes "問題の文字数: " + str(Now_lengh)
+        mes "入力文字数: " + str(Imput_length)
+        mes "総入力文字数: " + str(Imput_length_total + Imput_length)
+        mes "問題正解数: " + str(int(Seikai_count))
+        mes "総タイプ数: " + str(int(Key_count))
+        mes "問題配列番地: " + Text_Number
+        mes "読み込み問題数: " + str(int(Text_Num))
+        if Miss_Count == 1 {
+            mes "ミス数: Invalid"
+        } else {
+            mes "ミス数: "
+        }
+        mes "--------------------------------"
+    }
+
+    pos 520,350
+    mes "問題 " + str(int(Seikai_count)+1) + " / " + str(question_num)
+return
+
+; -------------------------------
+; 全問題正解 → 結果表示
+; -------------------------------
+*finish
+    end_flag = 1
+    window_clr 1
+    pos 20,0
+    mes "結果"
+	mes "------------------------------------------------------------"
+	mes "問題数　　　　　     ：" + str(question_num)
+	mes "入力文字数　　　     ：" + str(Imput_length_total + Imput_length)
+	mes "タイプ数　　　　     ：" + str(int(Key_count))
+	mes "経過時間 (s)　       ：" + strf("%4.2f",double(Elapsed_time)/1000)
+	mes "タイプ速度（/s | /m）：" + str((double(int(Key_count))/Elapsed_time)*1000) + " | " +str(((double(int(Key_count))/Elapsed_time)*60)*1000) 
+	mes "入力速度 (/s | /m)　 ：" + str((double((Imput_length_total + Imput_length))/Elapsed_time)*1000) + " | " + str(((double((Imput_length_total + Imput_length))/Elapsed_time)*60)*1000)
+	if Miss_Count = 0{
+		mes "ミス数　　　　　     ："
+	}
+	mes "------------------------------------------------------------"
+    mes "今回の問題(選択すると詳細を表示)"
+    repeat question_num
+        Result_List_char += str(cnt+1) + ": " + Text.(Result_List(cnt,0)) + "\n"
+    loop
+    objsize 600,140
+    listbox Result_List_Select, 100, Result_List_char
+    hResult_List = objinfo(stat, 2)
+    objsize 150,25
+    pos 50,440
+    button gosub "もういちど", *start
+    pos 200,440
+    button gosub "終了する", *ending
+    pos 350,440
+    button gosub "スコアボード", *scoreboard
+    stop
+return
+
+; -------------------------------
+; スコアボード (未実装)
+; -------------------------------
+*scoreboard
+    window_clr 1
+    mes "作成中…"
+    pos 50,440
+    button gosub "もどる", *finish
+    ; ここにスコアボード処理
+return
+
+; -------------------------------
+; オプション画面
+; -------------------------------
+*option
+    window_clr 1
+    oncmd gosub *WM_CMD, WM_COMMAND
+    Now_Option1_State = Asset_Type
+    
+    mes "問題のソースを選択"
+    txtarray1 = "内部テキストを使用する","外部テキストを使用する","それ以外のテキストファイルを選ぶ"
+    txtbuf1 = ""
+    notesel txtbuf1
+    repeat length(txtarray1)
+        noteadd txtarray1(cnt)
+    loop
+    objsize 250, 24
+    combox Asset_Type, 120, txtbuf1
+    option1_id = stat
+    hCombo1 = objinfo(stat, 2)
+
+    mes "ミスした文字を強調するか"
+    txtarray2 = "強調しない","強調する"
+    txtbuf2 = ""
+    notesel txtbuf2
+    repeat length(txtarray2)
+        noteadd txtarray2(cnt)
+    loop
+    objsize 250, 24
+    combox Miss_Use, 120, txtbuf2
+    option2_id = stat
+    hCombo2 = objinfo(stat, 2)
+
+    mes "詳細情報を表示するか"
+    txtarray3 = "表示しない","表示する"
+    txtbuf3 = ""
+    notesel txtbuf3
+    repeat length(txtarray3)
+        noteadd txtarray3(cnt)
+    loop
+    objsize 250, 24
+    combox Detail_info, 120, txtbuf3
+    option3_id = stat
+    hCombo3 = objinfo(stat, 2)
+
+    mes "ミス時にビープ音を鳴らすか"
+    txtarray4 = "鳴らす","鳴らさない"
+    txtbuf4 = ""
+    notesel txtbuf4
+    repeat length(txtarray4)
+        noteadd txtarray4(cnt)
+    loop
+    objsize 250, 24
+    combox Miss_Beep, 120, txtbuf4
+    option4_id = stat
+    hCombo4 = objinfo(stat, 2)
+
+    mes "ミス数の表示 (正確ではない可能性あり)"
+    txtarray5 = "表示する","表示しない"
+    txtbuf5 = ""
+    notesel txtbuf5
+    repeat length(txtarray5)
+        noteadd txtarray5(cnt)
+    loop
+    objsize 250, 24
+    combox Miss_Count, 120, txtbuf5
+    option5_id = stat
+    hCombo5 = objinfo(stat, 2)
+
+    mes "入力タイプ時に効果音を鳴らすか"
+    txtarray6 = "鳴らす","鳴らさない"
+    txtbuf6 = ""
+    notesel txtbuf6
+    repeat length(txtarray6)
+        noteadd txtarray6(cnt)
+    loop
+    objsize 250, 24
+    combox Type_SE, 120, txtbuf6
+    option6_id = stat
+    hCombo6 = objinfo(stat, 2)
+
+    mes "※[設定の保存] → 次回起動時に反映"
+    objsize 100, 24
+    button gosub "設定の保存", *optionsave
+    button gosub "設定の初期化", *optionclr
+    button gosub "戻る", *start
+    stop
+
+; -------------------------------
+; オプション変更時の処理
+; -------------------------------
+*WM_CMD
+    if lparam == hCombo1 && HIWORD(wparam) == CBN_SELCHANGE {
+        if txtarray1.Asset_Type == "外部テキストを使用する" {
+            notesel data
+            exist FOLDER_PASS + "\\Assets.txt"
+            if strsize == -1 {
+                folder_exist = make_folder(FOLDER_PASS)
+                if folder_exist == 1 {
+                    dialog "外部テキストファイル(Assets.txt)を作成しますか？",2
+                    if stat == 6 {
+                        noteadd "//これはTypingの外部テキストモジュールです",0
+                        noteadd "//先頭に[//]がある行は問題に含まれません",1
+                        noteadd "あああああ",2
+                        noteadd "いいいいい",3
+                        noteadd "ううううう",4
+                        noteadd "えええええ",5
+                        noteadd "おおおおお",6
+                        notesave FOLDER_PASS + "\\Assets.txt"
+                        dialog "Assets.txtを作成しました",0
+
+                        notesel data
+                        noteload FOLDER_PASS + "\\Assets.txt"
+                        Exp_Text_Num = 0
+                        repeat
+                            noteget text_buf, cnt
+                            if text_buf = "" : break
+                            if instr(text_buf, , "//") != 0 {
+                                Text_ext(Exp_Text_Num) = text_buf
+                                Exp_Text_Num++
+                            }
+                        loop
+                    } else : if stat == 7 {
+                        dialog "作成が却下されました",0
+                        objprm option1_id, 0
+                    }
+                } else {
+                    objprm option1_id, 0
+                }
+            } else {
+                noteload FOLDER_PASS + "\\Assets.txt"
+                Exp_Text_Num = 0
+                repeat
+                    noteget text_buf, cnt
+                    if text_buf = "" : break
+                    if instr(text_buf, , "//") != 0 {
+                        Text_ext(Exp_Text_Num) = text_buf
+                        Exp_Text_Num++
+                    }
+                loop
+            }
+        }
+        if txtarray1.Asset_Type == "それ以外のテキストファイルを選ぶ" {
+            sdim Other_Text, 128, 64
+            Defolt_dir = dir_cur
+            dialog "読み込むテキストファイルを選択してください", 0
+            dialog "txt", 16, "テキスト"
+            if stat == 1 {
+                if dir_cur != (Defolt_dir + "\\TypingGame") {
+                    dialog "TypingGameフォルダ外のファイルです。続行しますか？",3
+                    if stat == 7 {
+                        Asset_Type = Now_Option1_State
+                        objprm option1_id, Now_Option1_State
+                        return
+                    }
+                }
+                Other_Text_Pass = refstr
+                noteload refstr
+                Other_Text_Num = 0
+                repeat
+                    noteget text_buf, cnt
+                    if text_buf = "" : break
+                    if instr(text_buf, , "//") != 0 {
+                        Other_Text(Other_Text_Num) = text_buf
+                        Other_Text_Num++
+                    }
+                loop
+                mes "選択パス: " + refstr
+                chdir Defolt_dir
+            } else {
+                Asset_Type = Now_Option1_State
+                objprm option1_id, Now_Option1_State
+            }
+        }
+    }
+return
+
+; -------------------------------
+; オプションのセーブ
+; -------------------------------
+*optionsave
+    folder_exist = make_folder(FOLDER_PASS)
+    if folder_exist == 1 {
+        notesel option_note
+        exist FOLDER_PASS + "\\option.txt"
+        if strsize == -1 {
+            dialog "option.txtを新規作成しますか？",2,"ファイルがありません!"
+            if stat == 6 {
+                noteadd "//Typingの設定ファイル",0
+                noteadd "//内容を変更するとエラーの可能性があります",1
+                noteadd str(Asset_Type),2
+                noteadd str(Miss_Use),3
+                noteadd str(Detail_info),4
+                noteadd str(Miss_Beep),5
+                noteadd str(Other_Text_Pass),6
+                noteadd str(Miss_Count),7
+                noteadd str(Type_SE),8
+                notesave FOLDER_PASS + "\\option.txt"
+                dialog "設定を保存しました",0
+            } else : if stat == 7 {
+                dialog "作成が却下されました",0
+            }
+        } else {
+            noteadd "//Typingの設定ファイル",0,1
+            noteadd "//内容を変更するとエラーの可能性があります",1,1
+            noteadd str(Asset_Type),2,1
+            noteadd str(Miss_Use),3,1
+            noteadd str(Detail_info),4,1
+            noteadd str(Miss_Beep),5,1
+            noteadd str(Other_Text_Pass),6,1
+            noteadd str(Miss_Count),7,1
+            noteadd str(Type_SE),8,1
+            notesave FOLDER_PASS + "\\option.txt"
+            dialog "設定を上書き保存しました",0
+        }
+    }
+return
+
+; -------------------------------
+; オプション初期化
+; -------------------------------
+*optionclr
+    Asset_Type = 0
+    objprm option1_id, 0
+    Miss_Use = 1
+    objprm option2_id, 1
+    Detail_info = 0
+    objprm option3_id, 0
+    Miss_Beep = 1
+    objprm option4_id, 1
+    Miss_Count = 1
+    objprm option5_id, 1
+    Type_SE = 0
+    objprm option6_id, 0
+return
+
+; -------------------------------
+; キー入力処理
+; -------------------------------
+*key
+    if Start_flag == 1 {
+        Key_count = count(Key_count)
+        key_code = wparam
+        if Type_SE == 0 {
+            mmplay 0
+        }
+    }
+
+    if wparam == 13 {
+        if Start_flag == 0 {
+            if question_num == "" or question_num == 0 {
+                dialog "入力された問題数が不正です",1,"エラー"
+                window_clr 0
+                clrobj question_num_id, question_num_id
+                clrobj option_button_id, option_button_id
+                question_num = 10
+                gosub *start
+            }
+
+            repeat length(Text),1
+                Text.(cnt-1) = ""
+            loop
+
+            ; 問題を取得
+            if Asset_Type == 0 {
+                repeat length(Text_int),1
+                    Text_Num = count(Text_Num)
+                    Text.(cnt-1) = Text_int.(cnt-1)
+                    if Text_int.cnt = "" : break
+                loop
+            } else : if Asset_Type == 1 {
+                repeat length(Text_ext),1
+                    Text_Num = count(Text_Num)
+                    Text.(cnt-1) = Text_ext.(cnt-1)
+                    if Text_ext.cnt = "" : break
+                loop
+            } else : if Asset_Type == 2 {
+                repeat length(Other_Text),1
+                    Text_Num = count(Text_Num)
+                    Text.(cnt-1) = Other_Text.(cnt-1)
+                    if Other_Text.cnt = "" : break
+                loop
+            }
+
+            window_clr 0
+            mmload TYPE_SOUND, 0, 0
+            mmload COUNTDOWN, 1, 0
+            clrobj question_num_id, question_num_id
+            clrobj option_button_id, option_button_id
+            mmplay 1
+            mes "3..."
+            wait 100
+            pos 0,0
+            mes "3...2..."
+            wait 100
+            pos 0,0
+            mes "3...2...1..."
+            wait 100
+            pos 0,0
+            mes "3...2...1... start!"
+            wait 100
+            objsel Imput_Text_id
+            Start_flag = 1
+            Start_time = timeGetTime()
+            gosub *main
+        }
+    }
+
+    if wparam == 27 {
+        *ending
+        window_clr 1
+        mes "終了します"
+        wait 100
+        end
+    }
+return
